@@ -1,0 +1,1389 @@
+--- /Users/josh/Desktop/cs_capstone/reference/linux-2.6.8.1-unpatched/kernel/sched.c	Sat Aug 14 05:55:59 2004
++++ /Users/josh/Desktop/cs_capstone/josh_capstone_work/sched_commented_2.6.8.1.c	Sun Jan  2 03:24:40 2005
+@@ -18,6 +18,24 @@
+  *  2004-04-02	Scheduler domains code by Nick Piggin
+  */
+ 
++/*
++ * Additional comments by Josh Aas.
++ * Copyright (c)2004 Silicon Graphics, Inc. (SGI)
++ *
++ * Comments are situated above what they describe.
++ * 
++ * Abbreviations:
++ * RT - real-time (as in a "real-time process")
++ * UP - uniprocessor
++ *
++ * Notes:
++ * - SMT means symmetric multithreading. This is not the same thing as
++ *   SMP. An example of an SMT system is an Intel Pentium 4 Hyper-Threading (HT)
++ *   enabled processor. Basically, a single SMT chip can run multiple threads,
++ *   which has some interesting scheduler implications since the threads
++ *   share certain physical CPU resources.
++ */
++
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/nmi.h>
+@@ -44,6 +62,18 @@
+ 
+ #include <asm/unistd.h>
+ 
++/*
++ * NUMA architectures have groups of CPUs (and memory) organized
++ * into nodes. These macros are for getting the CPU mask for
++ * a node that a CPU belongs to.
++ *
++ * If the kernel is compiled for a NUMA architecture, do a node lookup
++ * by getting a CPU's node and then getting the CPU mask/map for
++ * that node. If non-NUMA, there will only be one mask/map, so insert that.
++ *
++ * Note that these NUMA macros are not used. They should probably have been
++ * removed from this file.
++ */
+ #ifdef CONFIG_NUMA
+ #define cpu_to_node_mask(cpu) node_to_cpumask(cpu_to_node(cpu))
+ #else
+@@ -54,6 +84,25 @@
+  * Convert user-nice values [ -20 ... 0 ... 19 ]
+  * to static priority [ MAX_RT_PRIO..MAX_PRIO-1 ],
+  * and back.
++ *
++ * PRIO values are the priority values that the Linux scheduler uses internally.
++ * Possible PRIO values for RT tasks are 0 through (MAX_RT_PRIO - 1), and possible PRIO
++ * values for non-RT tasks are MAX_RT_PRIO through (MAX_PRIO - 1). The lower a task's
++ * PRIO value, the higher its priority. With this setup, RT tasks will always have
++ * a higher priority than non-RT tasks.
++ *
++ * For non-RT tasks, in order to convert a user-nice value to a PRIO value, one would
++ * start with MAX_RT_PRIO, add the user-nice value, and then add 20 to make up for the
++ * fact that the highest possible priority user-nice value is -20. Converting from a
++ * PRIO value to a user-nice value is just the opposite. This is what the
++ * NICE_TO_PRIO(nice) and PRIO_TO_NICE(prio) macros do.
++ *
++ * TASK_NICE(p) simply gets the user-nice value for a given task. Each task has a
++ * static and a dynamic priority value. The static priority value is set by users
++ * via the nice() system call and ranges from -20 to 19. It is stored as a PRIO. The
++ * dynamic priority is based on a task's static priority, but it is modified based
++ * on interactivity. The dynamic priority is not relevent here, but is mentioned in
++ * order to explain why TASK_NICE(p) is determined by a task's static_prio field.
+  */
+ #define NICE_TO_PRIO(nice)	(MAX_RT_PRIO + (nice) + 20)
+ #define PRIO_TO_NICE(prio)	((prio) - MAX_RT_PRIO - 20)
+@@ -63,6 +112,23 @@
+  * 'User priority' is the nice value converted to something we
+  * can work with better when scaling various scheduler parameters,
+  * it's a [ 0 ... 39 ] range.
++ *
++ * USER_PRIO(p) takes an interal non-RT priority and returns its
++ * priority in terms of 0-39. It is only used by the other macros
++ * in this group as values of 0-39 don't mean anything in terms of
++ * internal PRIO values or user-nice values. It is simply a shortcut.
++ *
++ * TASK_USER_PRIO is not used by anything, and should be removed from
++ * the kernel. It is a useless calculation for the reason described above.
++ * All it doers is return a task's USER_PRIO.
++ *
++ * MAX_USER_PRIO returns the total number of different priority levels
++ * non-RT processes can have. In this case, it resoves to 40 (100-139).
++ *
++ * AVG_TIMESLICE basically resolves to the half-way point between MIN_TIMESLICE
++ * and MAX_TIMESLICE. The reason it isn't written simply like that is so the
++ * algorithm can withstand changes to the priority system. It resolves to about
++ * 100ms.
+  */
+ #define USER_PRIO(p)		((p)-MAX_RT_PRIO)
+ #define TASK_USER_PRIO(p)	USER_PRIO((p)->static_prio)
+@@ -72,6 +138,13 @@
+ 
+ /*
+  * Some helpers for converting nanosecond timing to jiffy resolution
++ *
++ * A nanosecond (NS) is one-billionth of a second. A jiffy is a period of time
++ * calculated by 1/HZ, where HZ is the architecture-defined number of ticks
++ * per second. So, to convert from nanoseconds to jiffies, one divides a billion
++ * by HZ (which results in the number of nanoseconds in a jiffy), and divides
++ * the number of nanoseconds by that. Jiffies to NS is the same, but multiply
++ * the number of jiffies by the number of nanoseconds in a jiffy.
+  */
+ #define NS_TO_JIFFIES(TIME)	((TIME) / (1000000000 / HZ))
+ #define JIFFIES_TO_NS(TIME)	((TIME) * (1000000000 / HZ))
+@@ -79,9 +152,46 @@
+ /*
+  * These are the 'tuning knobs' of the scheduler:
+  *
+- * Minimum timeslice is 10 msecs, default timeslice is 100 msecs,
+- * maximum timeslice is 200 msecs. Timeslices get refilled after
+- * they expire.
++ * MIN_TIMESLICE is the minimum timeslice that a task can be given. It resolves to about 10ms.
++ *
++ * MAX_TIMESLCIE is the maximum timeslice that a task can be given. It resolves to about 200ms.
++ *
++ * ON_RUNQUEUE_WEIGHT ...
++ *
++ * CHILD_PENALTY is the penalty that the sleep_avg of forked child tasks gets
++ * in order to prevent very interactive tasks from spawning other very interactive
++ * tasks.
++ *
++ * PARENT_PENALTY is the penalty that the sleep_avg of parents who forked tasks
++ * gets in order to prevent very interactive tasks from spawning other very interactive
++ * tasks.
++ *
++ * EXIT_WEIGHT ...
++ *
++ * PRIO_BONUS_RATIO is the ratio used to determine MAX_BONUS. 
++ *
++ * MAX_BONUS ...  MAX_USER_PRIO ressolves to 40, and PRIO_BONUS_RATIO is 25.
++ * So essentially this means that the max bonus that can be
++ * given to a task is 25% of the total non-RT priority
++ * range. Since there are 40 possible non-RT priorities, this
++ * resolves to 10.
++ *
++ * INTERACTIVE_DELTA is the static component used to determine whether or not a task
++ * should be considered interactive. The higher this is, the more difficult it is for
++ * tasks to be considered interactive. See the DELTA and TASK_INTERACTIVE macros for
++ * more information.
++ *
++ * MAX_SLEEP_AVG is the number of jiffies that is the maximum average sleep time for
++ * a task. The higher a task's sleep_avg, the more interactive it is, so this essentially
++ * puts a limit on how interactive a task can be.
++ *
++ * STARVATION_LIMIT is the time limit for which a runnable task may be deprived of
++ * CPU time before it is considered to be starving.
++ *
++ * NS_MAX_SLEEP_AVG is the same as MAX_SLEEP_AVG, but in nanoseconds.
++ *
++ * CREDIT_LIMIT is used to determine whether or not a task has high or low interactivity
++ * credit. See the macros HIGH_CREDIT and LOW_CREDIT.
+  */
+ #define MIN_TIMESLICE		( 10 * HZ / 1000)
+ #define MAX_TIMESLICE		(200 * HZ / 1000)
+@@ -101,7 +211,9 @@
+  * If a task is 'interactive' then we reinsert it in the active
+  * array after it has expired its current timeslice. (it will not
+  * continue to run immediately, it will still roundrobin with
+- * other interactive tasks.)
++ * other interactive tasks.) This behavior does not prevent the expired
++ * and unexpired queues from ever being swapped - they will get swapped
++ * as soon as something in the expired queue is going to starve.
+  *
+  * This part scales the interactivity limit depending on niceness.
+  *
+@@ -116,7 +228,9 @@
+  *
+  * (the X axis represents the possible -5 ... 0 ... +5 dynamic
+  *  priority range a task can explore, a value of '1' means the
+- *  task is rated interactive.)
++ *  task is rated interactive. So - there are 11 columns. The middle
++ *  column is whether or not a task with a certain user-nice level
++ *  is considered interactive if given no + or - bonus at all.)
+  *
+  * Ie. nice +19 tasks can never get 'interactive' enough to be
+  * reinserted into the active array. And only heavily CPU-hog nice -20
+@@ -125,10 +239,26 @@
+  * too hard.
+  */
+ 
++/*
++ * The process's current bonus is its sleep average in jiffies times MAX_BONUS
++ * divided by MAX_SLEEP_AVG. Essentially it scales a processes sleep average into
++ * the range MAX_BONUS.
++ */
+ #define CURRENT_BONUS(p) \
+ 	(NS_TO_JIFFIES((p)->sleep_avg) * MAX_BONUS / \
+ 		MAX_SLEEP_AVG)
+ 
++/*
++ * If an interactive task has too long a timeslice, it may
++ * be preempted by a task of equal priority. The task
++ * does not lose its timeslice, it is just put on the bottom of the
++ * list of tasks of its priority waiting to run. If there
++ * was a task of higher priority, it would have already preempted
++ * a given task. TIMESLICE_GRANULARITY is the time limit for
++ * what is considered "too long" a timeslice. It is called granularity
++ * because the timeslice is effectively broken up if it is longer than
++ * TIMESLICE_GRANULARITY.
++ */
+ #ifdef CONFIG_SMP
+ #define TIMESLICE_GRANULARITY(p)	(MIN_TIMESLICE * \
+ 		(1 << (((MAX_BONUS - CURRENT_BONUS(p)) ? : 1) - 1)) * \
+@@ -138,12 +268,38 @@
+ 		(1 << (((MAX_BONUS - CURRENT_BONUS(p)) ? : 1) - 1)))
+ #endif
+ 
++/*
++ * This macro is used in the TASK_INTERACTIVE macro to decide if a
++ * task should be considered interactive. SCALE calculates how much
++ * higher in priority a task must be from its nice value, minus the
++ * INTERACTIVE_DELTA, in order to be considered interactive. The idea
++ * is that tasks with a higher priority nice value should not need to
++ * be given as much of a bonus in order to be considered interactive
++ * as tasks given a lower priority nice value. So, a task with a -10
++ * nice value will be more easily considered interactive than a task
++ * with a +10 nice value. Since INTERACTIVE_DELTA is static, SCALE
++ * provides a value to add to it in order to do the interactivity scaling.
++ */
+ #define SCALE(v1,v1_max,v2_max) \
+ 	(v1) * (v2_max) / (v1_max)
+ 
++/* 
++ * A task must be DELTA higher in priority than its nice
++ * value in order to be considered interactive. This value
++ * is the combination of the scaled factor and the constant
++ * INTERACTIVE_DELTA factor.
++ */
+ #define DELTA(p) \
+ 	(SCALE(TASK_NICE(p), 40, MAX_BONUS) + INTERACTIVE_DELTA)
+ 
++/* 
++ * This macro returns whether or not a task should be considered
++ * interactive. If a task's priority value (lower values are higher
++ * priority) is less than or equal to its static_prio (i.e. nice value)
++ * minus DELTA, then it is interactive. This is because tasks are given
++ * given priority-raising bonuses (prio lowering) based on heuristics
++ * that measure characteristics of interactivity.
++ */
+ #define TASK_INTERACTIVE(p) \
+ 	((p)->prio <= (p)->static_prio - DELTA(p))
+ 
+@@ -157,6 +313,10 @@
+ #define LOW_CREDIT(p) \
+ 	((p)->interactive_credit < -CREDIT_LIMIT)
+ 
++/*
++ * just tells whether or not there is a task in rq that
++ * should preempt the task p.
++ */
+ #define TASK_PREEMPTS_CURR(p, rq) \
+ 	((p)->prio < (rq)->curr->prio)
+ 
+@@ -170,30 +330,91 @@
+  *
+  * task_timeslice() is the interface that is used by the scheduler.
+  */
+-
+-#define BASE_TIMESLICE(p) (MIN_TIMESLICE + \
+-		((MAX_TIMESLICE - MIN_TIMESLICE) * \
+-			(MAX_PRIO-1 - (p)->static_prio) / (MAX_USER_PRIO-1)))
++#define BASE_TIMESLICE(p) (MIN_TIMESLICE + ((MAX_TIMESLICE - MIN_TIMESLICE) * \
++			                     (MAX_PRIO-1 - (p)->static_prio) / (MAX_USER_PRIO-1)))
+ 
+ static unsigned int task_timeslice(task_t *p)
+ {
+ 	return BASE_TIMESLICE(p);
+ }
+ 
++/*
++ * The task_hot macro takes a process, the current time, and a scheduler domain.
++ * A scheduler domain is essentially a grouping a processors that share cache.
++ * task_hot determines whether or not cache in a scheduler domain is likely
++ * to contain data that the given process could use. The value cache_hot_time
++ * is the amount of time that data is likely to remain the cache. Thus, if
++ * the time between when the process was last run and now is less than that
++ * amount of time, it is likely that the cache will still be hot (i.e. contain
++ * relevant data).
++ */
+ #define task_hot(p, now, sd) ((now) - (p)->timestamp < (sd)->cache_hot_time)
+ 
++/* These are the runqueue data structures: */
++
+ /*
+- * These are the runqueue data structures:
++ * The BITMAP_SIZE macro resolves to the number of long integers
++ * required to create a bitmap with one bit per scheduler priority
++ * (there are MAX_PRIO priorities).
++ *
++ * The "...+1+7)/8" part might seem odd. MAX_PRIO + 1 covers all priorities,
++ * adding 7 ensures that division by 8 will result in a number > 1.
+  */
+-
+ #define BITMAP_SIZE ((((MAX_PRIO+1+7)/8)+sizeof(long)-1)/sizeof(long))
+ 
+ typedef struct runqueue runqueue_t;
+ 
++/*
++ * The prio_array data structure is extremely important as it is what allows
++ * the Linux scheduling algorithm to perform in O(1) time.
++ *
++ * The basic structure in the Linux scheduler is the runqueue, defined below.
++ * There is one runqueue per processor, and within that runqueue there are two
++ * structures of type prio_array. One is for tasks that have not used up their
++ * timeslice yet, the other is for tasks that have used up their timeslice. The
++ * former are considered active, the latter expired. Note that active and expired
++ * has nothing to do with whether or not a task is runnable - active simply means
++ * that since the last time timeslices were allocated, a given task in that queue
++ * has not used up its timeslice. A task in the active list still has time available
++ * on the CPU, tasks in the expired list have used up their timeslice.
++ *
++ * The nr_active value stores the number of runnable tasks in the prio_array. The
++ * bitmap is a string of bits, one for each priority level on the system (140 by
++ * default), that indicates whether or not there are any tasks in the prio_array
++ * at a given priority level. The queue value is an array of pointers to arrays
++ * that store all tasks at a given priority level.
++ *
++ * So if there is only one runnable task in the prio_array, nr_active will be equal to
++ * one. If that task is not RT, and it has a nice value of 20, there will be
++ * a one in the 119th position of the bitmap to indicate that there is a task in the
++ * prio_array at that priority level. The queue array would have a pointer at the 119th
++ * position pointing to an array of length 1, its single element being the task in question.
++ *
++ * This is very useful because in order to determine the next task to run, the scheduler simply
++ * 1) looks to see if there are any runnable tasks in its active prio_array (i.e. is nr_active > 0)
++ * 2) if so, go to step 3 otherwise go to step 6
++ * 3) find the first 1 in the active prio_array's bitmap. There must be a 1 somewhere since
++ *    we know that there is a task in the prio_array and it must have a priority level.
++ * 4) run the first task in the array at the position in the prio_array's queue equal to
++ *    the first 1 found in the bitmap.
++ * 5) when the task is done running for some reason,  recalculate its new timeslice and put it
++ *    in the expired prio_array. decement nr_active in the active prio_array, and increment
++ *    it in the expired prio_array. if the task was the last task at a given priority,
++ *    clear the priority's bit in the active prio_array and make sure the priority's bit
++ *    is set in the expired prio_array. repeat steps 1-4 until no tasks exist in the active
++ *    prio_array.
++ * 6) when no tasks exist in the active prio_array, swap the active and inactive prio_arrays
++ *    and start over again. since timeslices are recalculated for each process when
++ *    it is put onto the expired array, the swap of prio_arrays is fast (i.e. no
++ *    sitting around recalculating a timeslice for every task)
++ *
++ * This results in O(1) behavior since no step in the process requires iterating over a number
++ * of tasks that grows larger when the total number of tasks grows.
++ */
+ struct prio_array {
+-	unsigned int nr_active;
+-	unsigned long bitmap[BITMAP_SIZE];
+-	struct list_head queue[MAX_PRIO];
++	unsigned int nr_active; /* number of runnable tasks in this prio_array */
++	unsigned long bitmap[BITMAP_SIZE]; /* bitmap showing which priority levels contain tasks */
++	struct list_head queue[MAX_PRIO]; /* a list of array heads, one for each priority on the system */
+ };
+ 
+ /*
+@@ -204,50 +425,61 @@ struct prio_array {
+  * acquire operations must be ordered by ascending &runqueue.
+  */
+ struct runqueue {
+-	spinlock_t lock;
++	spinlock_t lock; /* lock that protects this runqueue */
+ 
+-	/*
+-	 * nr_running and cpu_load should be in the same cacheline because
+-	 * remote CPUs use both these fields when doing load calculation.
+-	 */
+-	unsigned long nr_running;
++  /*
++   * nr_running and cpu_load should be in the same cacheline because
++   * remote CPUs use both these fields when doing load calculation.
++   */
++	unsigned long nr_running; /* number of runnable tasks */
+ #ifdef CONFIG_SMP
+-	unsigned long cpu_load;
++	unsigned long cpu_load; /* this CPU's load */
+ #endif
+-	unsigned long long nr_switches;
+-	unsigned long expired_timestamp, nr_uninterruptible;
+-	unsigned long long timestamp_last_tick;
+-	task_t *curr, *idle;
+-	struct mm_struct *prev_mm;
+-	prio_array_t *active, *expired, arrays[2];
+-	int best_expired_prio;
+-	atomic_t nr_iowait;
++	unsigned long long nr_switches; /* number of context switches */
++	unsigned long expired_timestamp, nr_uninterruptible; /* time of last array swap and number of
++                                                          uninterruptible processes in queue */
++	unsigned long long timestamp_last_tick; /* timestamp of last scheduler tick */
++	task_t *curr, *idle; /* this processors current and idle task */
++	struct mm_struct *prev_mm; /* the last running task's mm_struct */
++	prio_array_t *active, *expired, arrays[2]; /* the active and expired prio_arrays */
++	int best_expired_prio; /* highest priority that exists in the expired prio_array */
++	atomic_t nr_iowait; /* number of tasks in the queue waiting on i/o */
+ 
+ #ifdef CONFIG_SMP
+-	struct sched_domain *sd;
++	struct sched_domain *sd; /* in SMP systems there can be different scheduler domains */
+ 
+ 	/* For active balancing */
+-	int active_balance;
++	int active_balance; /* */
+ 	int push_cpu;
+ 
++  /* this migration thread for the processor that this runqueue belongs to */
+ 	task_t *migration_thread;
+ 	struct list_head migration_queue;
+ #endif
+ };
+ 
++/* Define one runqueue per CPU. */
+ static DEFINE_PER_CPU(struct runqueue, runqueues);
+ 
++/* Iterate through domains that a CPU is a part of */
+ #define for_each_domain(cpu, domain) \
+ 	for (domain = cpu_rq(cpu)->sd; domain; domain = domain->parent)
+ 
++/*
++ * cpu_rq gets the runqueue for a given cpu
++ *
++ * this_rq gets the runqueue for the current cpu
++ * 
++ * task_rq gets the runqueue that a certain task is in
++ *
++ * cpu_curr gets the current task on a given CPU
++ */
+ #define cpu_rq(cpu)		(&per_cpu(runqueues, (cpu)))
+ #define this_rq()		(&__get_cpu_var(runqueues))
+ #define task_rq(p)		cpu_rq(task_cpu(p))
+ #define cpu_curr(cpu)		(cpu_rq(cpu)->curr)
+ 
+-/*
+- * Default context-switch locking:
+- */
++/* Default context-switch locking */
+ #ifndef prepare_arch_switch
+ # define prepare_arch_switch(rq, next)	do { } while (0)
+ # define finish_arch_switch(rq, next)	spin_unlock_irq(&(rq)->lock)
+@@ -264,23 +496,28 @@ static runqueue_t *task_rq_lock(task_t *
+ 	struct runqueue *rq;
+ 
+ repeat_lock_task:
+-	local_irq_save(*flags);
+-	rq = task_rq(p);
+-	spin_lock(&rq->lock);
++	local_irq_save(*flags); /* save irq flags */
++	rq = task_rq(p); /* get runqueue for the task */
++	spin_lock(&rq->lock); /* lock the runqueue */
++  /* make sure the task is still on the runqueue we just locked */
+ 	if (unlikely(rq != task_rq(p))) {
++    /* if not, unlock and restore irq flags, then try again */
+ 		spin_unlock_irqrestore(&rq->lock, *flags);
+ 		goto repeat_lock_task;
+ 	}
+ 	return rq;
+ }
+ 
++/* simply unlock a runqueue, not as touchy as locking! */
+ static inline void task_rq_unlock(runqueue_t *rq, unsigned long *flags)
+ {
+ 	spin_unlock_irqrestore(&rq->lock, *flags);
+ }
+ 
+ /*
+- * rq_lock - lock a given runqueue and disable interrupts.
++ * rq_lock - lock the current processor's runqueue and disable interrupts.
++ * Since the current CPU is executing this code, its runqueue is easier to
++ * lock than if we were trying to lock some other CPU's runqueue (see task_rq_lock()).
+  */
+ static runqueue_t *this_rq_lock(void)
+ {
+@@ -293,6 +530,10 @@ static runqueue_t *this_rq_lock(void)
+ 	return rq;
+ }
+ 
++/* 
++ * A convenience method for making sure that runqueues get unlocked
++ * via the right lock mechanism.
++ */
+ static inline void rq_unlock(runqueue_t *rq)
+ {
+ 	spin_unlock_irq(&rq->lock);
+@@ -303,24 +544,37 @@ static inline void rq_unlock(runqueue_t 
+  */
+ static void dequeue_task(struct task_struct *p, prio_array_t *array)
+ {
+-	array->nr_active--;
++	array->nr_active--; /* one less active task in the array */
+ 	list_del(&p->run_list);
++  /* 
++   * Clear the bit that says there is a task in the prio array with a certain priority
++   * if no more tasks at p's priority in the prio array.
++   */
+ 	if (list_empty(array->queue + p->prio))
+ 		__clear_bit(p->prio, array->bitmap);
+ }
+ 
+ static void enqueue_task(struct task_struct *p, prio_array_t *array)
+ {
++  /* add the task at the right spot in the prio array */
+ 	list_add_tail(&p->run_list, array->queue + p->prio);
++  /* 
++   * set the bit that says there is at least one task in the prio array
++   * with priority p->prio
++   */
+ 	__set_bit(p->prio, array->bitmap);
+-	array->nr_active++;
+-	p->array = array;
++	array->nr_active++; /* one more active task in the array */
++	p->array = array; /* set the field in the task that says what prio array it is in */
+ }
+ 
+ /*
+- * Used by the migration code - we pull tasks from the head of the
+- * remote queue so we want these tasks to show up at the head of the
+- * local queue:
++ * Migration code always has the highest priority. When CPUs go down (become
++ * idle), the idle task must get a higher priority than the migration code.
++ * This function is used by __activate_idle_task, which is called by
++ * sched_idle_next. sched_idle_next is called when CPUs get taken down.
++ * 
++ * This is really similar to enqueue task, except it adds to the top of the list
++ * instead of the tail (list_add() instead of list_add_tail()).
+  */
+ static inline void enqueue_task_head(struct task_struct *p, prio_array_t *array)
+ {
+@@ -347,13 +601,28 @@ static inline void enqueue_task_head(str
+ static int effective_prio(task_t *p)
+ {
+ 	int bonus, prio;
+-
++  
++  /* don't do anything if this is a RT task */
+ 	if (rt_task(p))
+ 		return p->prio;
+ 
++  /*
++   * take the CURRENT_BONUS, which is sleep_avg mapped onto
++   * 0-MAX_BONUS, and subtract half of MAX_BONUS since it is
++   * twice the possible + or - bonus. So if MAX_BONUS is 10,
++   * and a task sleeps a lot, it might get a CURRENT_BONUS of
++   * say, 8. Subtracting 5, that makes 3. This will be subtracted
++   * from static_prio since the task should have a high priority
++   * and lower prio values are higher priority. If a task sleeps
++   * very little, the bonus value calculated here will be negative.
++   * In that case, the negative value will get subtracted from
++   * static_prio, lowering the priority.
++   */
+ 	bonus = CURRENT_BONUS(p) - MAX_BONUS / 2;
+ 
++  /* give the task a prio based on the just-calculated bonus and static_prio */
+ 	prio = p->static_prio - bonus;
++  /* make sure the prio value is within non-RT bounds and return it */
+ 	if (prio < MAX_RT_PRIO)
+ 		prio = MAX_RT_PRIO;
+ 	if (prio > MAX_PRIO-1)
+@@ -379,8 +648,21 @@ static inline void __activate_idle_task(
+ 	rq->nr_running++;
+ }
+ 
++/*
++ * This function recalculates a task's priority ("I know this because I can
++ * read" - John Fraser Hart). It is called by the main schedule() function
++ * when a task is moved to the expired prio array, and also when tasks are
++ * activated.
++ */
+ static void recalc_task_prio(task_t *p, unsigned long long now)
+ {
++  /*
++   * __sleep_time is used because an unsigned long long will be able
++   * to hold a huge number, which might be the case in the calculation
++   * of "now - p-> timestamp" but will not be the case if the number
++   * is kept <= NS_MAX_SLEEP_AVG. So, once the number is calculated to
++   * be <= NS_MAX_SLEEP_AVG, then the unsigned long sleep_time is used.
++   */
+ 	unsigned long long __sleep_time = now - p->timestamp;
+ 	unsigned long sleep_time;
+ 
+@@ -393,7 +675,7 @@ static void recalc_task_prio(task_t *p, 
+ 		/*
+ 		 * User tasks that sleep a long time are categorised as
+ 		 * idle and will get just interactive status to stay active &
+-		 * prevent them suddenly becoming cpu hogs and starving
++		 * prevent them from suddenly becoming cpu hogs and starving
+ 		 * other processes.
+ 		 */
+ 		if (p->mm && p->activated != -1 &&
+@@ -405,7 +687,9 @@ static void recalc_task_prio(task_t *p, 
+ 		} else {
+ 			/*
+ 			 * The lower the sleep avg a task has the more
+-			 * rapidly it will rise with sleep time.
++			 * rapidly it will rise with sleep time. If a task
++       * has a high sleep avg, CURRENT_BONUS(p) will be high,
++       * and thus MAX_BONUS - CURRENT_BONUS(p) will be low.
+ 			 */
+ 			sleep_time *= (MAX_BONUS - CURRENT_BONUS(p)) ? : 1;
+ 
+@@ -507,7 +791,13 @@ static void activate_task(task_t *p, run
+  */
+ static void deactivate_task(struct task_struct *p, runqueue_t *rq)
+ {
++  /* one less running task */
+ 	rq->nr_running--;
++  /* 
++   * this is leaving the running state and
++   * becoming uninterruptible, so increment
++   * nr_uninterruptible
++   */
+ 	if (p->state == TASK_UNINTERRUPTIBLE)
+ 		rq->nr_uninterruptible++;
+ 	dequeue_task(p, p->array);
+@@ -527,7 +817,7 @@ static void resched_task(task_t *p)
+ 	int need_resched, nrpolling;
+ 
+ 	preempt_disable();
+-	/* minimise the chance of sending an interrupt to poll_idle() */
++	/* minimize the chance of sending an interrupt to poll_idle() */
+ 	nrpolling = test_tsk_thread_flag(p,TIF_POLLING_NRFLAG);
+ 	need_resched = test_and_set_tsk_thread_flag(p,TIF_NEED_RESCHED);
+ 	nrpolling |= test_tsk_thread_flag(p,TIF_POLLING_NRFLAG);
+@@ -543,15 +833,19 @@ static inline void resched_task(task_t *
+ }
+ #endif
+ 
+-/**
++/*
+  * task_curr - is this task currently executing on a CPU?
+- * @p: the task in question.
+  */
+ inline int task_curr(const task_t *p)
+ {
+ 	return cpu_curr(task_cpu(p)) == p;
+ }
+ 
++/*
++ * This section contains code for migrating tasks between CPUs on
++ * SMP systems
++ */
++
+ #ifdef CONFIG_SMP
+ enum request_type {
+ 	REQ_MOVE_TASK,
+@@ -563,11 +857,11 @@ typedef struct {
+ 	enum request_type type;
+ 
+ 	/* For REQ_MOVE_TASK */
+-	task_t *task;
+-	int dest_cpu;
++	task_t *task; /* task to operate on */
++	int dest_cpu; /* if REQ_MOVE_TASK, this is the destination CPU */
+ 
+ 	/* For REQ_SET_DOMAIN */
+-	struct sched_domain *sd;
++	struct sched_domain *sd; /* destination domain */
+ 
+ 	struct completion done;
+ } migration_req_t;
+@@ -589,6 +883,10 @@ static int migrate_task(task_t *p, int d
+ 		return 0;
+ 	}
+ 
++  /*
++   * fill in migration request fields and add task to a
++   * migration queue, to be migrated later
++   */
+ 	init_completion(&req->done);
+ 	req->type = REQ_MOVE_TASK;
+ 	req->task = p;
+@@ -640,6 +938,13 @@ void kick_process(task_t *p)
+ 
+ 	preempt_disable();
+ 	cpu = task_cpu(p);
++  /* 
++   * If the process is on this CPU, then its already in kernel mode, because we're
++   * executing right now. In that case, don't tell it to reschedule. If the process
++   * is not the current process on some CPU, then kernel mode must kick in before
++   * it runs so again, don't bother rescheduling it. It should be obvious why this
++   * function doesn't apply on a UP system.
++   */
+ 	if ((cpu != smp_processor_id()) && task_curr(p))
+ 		smp_send_reschedule(cpu);
+ 	preempt_enable();
+@@ -661,9 +966,7 @@ static inline unsigned long source_load(
+ 	return min(rq->cpu_load, load_now);
+ }
+ 
+-/*
+- * Return a high guess at the load of a migration-target cpu
+- */
++/* Return a high guess at the load of a migration-target cpu */
+ static inline unsigned long target_load(int cpu)
+ {
+ 	runqueue_t *rq = cpu_rq(cpu);
+@@ -672,7 +975,7 @@ static inline unsigned long target_load(
+ 	return max(rq->cpu_load, load_now);
+ }
+ 
+-#endif
++#endif /* CONFIG_SMP */
+ 
+ /*
+  * wake_idle() is useful especially on SMT architectures to wake a
+@@ -689,16 +992,28 @@ static int wake_idle(int cpu, task_t *p)
+ 	struct sched_domain *sd;
+ 	int i;
+ 
++  /* if the task is already on an idle CPU, leave it there */
+ 	if (idle_cpu(cpu))
+ 		return cpu;
+ 
++  /* don't change CPUs if the scheduler domain does not support WAKE_IDLE */
+ 	sd = rq->sd;
+ 	if (!(sd->flags & SD_WAKE_IDLE))
+ 		return cpu;
+ 
++  /*
++   * First, put the &'ed value of the scheduler domain span
++   * and the online CPU map into tmp. Then, & tmp with the
++   * cpus that p is allowed to run on. That gives a list
++   * of potential CPUs in the map tmp.
++   */
+ 	cpus_and(tmp, sd->span, cpu_online_map);
+ 	cpus_and(tmp, tmp, p->cpus_allowed);
+ 
++  /* 
++   * cycle through the cpu map tmp, made above,
++   * and send the task to the first idle CPU.
++   */
+ 	for_each_cpu_mask(i, tmp) {
+ 		if (idle_cpu(i))
+ 			return i;
+@@ -739,26 +1054,35 @@ static int try_to_wake_up(task_t * p, un
+ 	int new_cpu;
+ #endif
+ 
++  /*
++   * lock the task's runqueue, disabling interrupts,
++   * then check to see if the task is in one of the
++   * states we wish to wake it from. If not, get out.
++   */
+ 	rq = task_rq_lock(p, &flags);
+ 	old_state = p->state;
+ 	if (!(old_state & state))
+ 		goto out;
+ 
++  /* the task is already awake if it is in a prio array! */
+ 	if (p->array)
+ 		goto out_running;
+-
++  
+ 	cpu = task_cpu(p);
+ 	this_cpu = smp_processor_id();
+ 
+ #ifdef CONFIG_SMP
++  /* if the task is running but was interrupted, we just need to activate it */
+ 	if (unlikely(task_running(rq, p)))
+ 		goto out_activate;
+ 
+ 	new_cpu = cpu;
+ 
++  /* if the task's CPU is this CPU or this CPU is not one it is allowed on... */
+ 	if (cpu == this_cpu || unlikely(!cpu_isset(this_cpu, p->cpus_allowed)))
+ 		goto out_set_cpu;
+ 
++  /* grab the load on the source and target CPUs */ 
+ 	load = source_load(cpu);
+ 	this_load = target_load(this_cpu);
+ 
+@@ -809,8 +1133,10 @@ out_set_cpu:
+ 		/* might preempt at this point */
+ 		rq = task_rq_lock(p, &flags);
+ 		old_state = p->state;
++    /* If the state of p is not one we wish to wake from, get out */
+ 		if (!(old_state & state))
+ 			goto out;
++    /* if p is in a prio array, it is already running */
+ 		if (p->array)
+ 			goto out_running;
+ 
+@@ -852,6 +1178,7 @@ out:
+ 	return success;
+ }
+ 
++/* just an exported convenience function for try_to_wake_up() */
+ int fastcall wake_up_process(task_t * p)
+ {
+ 	return try_to_wake_up(p, TASK_STOPPED |
+@@ -899,7 +1226,8 @@ void fastcall sched_fork(task_t *p)
+ 	p->time_slice = (current->time_slice + 1) >> 1;
+ 	/*
+ 	 * The remainder of the first timeslice might be recovered by
+-	 * the parent if the child exits early enough.
++	 * the parent if the child exits early enough. Set first_time_slice
++   * in order to indicate that that p's timeslice is reclaimable.
+ 	 */
+ 	p->first_time_slice = 1;
+ 	current->time_slice >>= 1;
+@@ -930,6 +1258,7 @@ void fastcall wake_up_forked_process(tas
+ 	unsigned long flags;
+ 	runqueue_t *rq = task_rq_lock(current, &flags);
+ 
++  /* The freshly forked process should not already be running! */
+ 	BUG_ON(p->state != TASK_RUNNING);
+ 
+ 	/*
+@@ -943,14 +1272,17 @@ void fastcall wake_up_forked_process(tas
+ 	p->sleep_avg = JIFFIES_TO_NS(CURRENT_BONUS(p) *
+ 		CHILD_PENALTY / 100 * MAX_SLEEP_AVG / MAX_BONUS);
+ 
++  /* Start of with interactive credit of 0. */
+ 	p->interactive_credit = 0;
+ 
++  /* Set an initial priority and CPU. The initial CPU is the current CPU. */
+ 	p->prio = effective_prio(p);
+ 	set_task_cpu(p, smp_processor_id());
+ 
++  /* If the task is not already on a runqueue prio array, put it on one. */
+ 	if (unlikely(!current->array))
+ 		__activate_task(p, rq);
+-	else {
++	else { /* Otherwise just situate it in the runqueue its in. */
+ 		p->prio = current->prio;
+ 		list_add_tail(&p->run_list, &current->run_list);
+ 		p->array = current->array;
+@@ -975,6 +1307,10 @@ void fastcall sched_exit(task_t * p)
+ 	runqueue_t *rq;
+ 
+ 	local_irq_save(flags);
++  /*
++   * if the exiting child was only on its first time slice,
++   * give it back to the parent
++   */
+ 	if (p->first_time_slice) {
+ 		p->parent->time_slice += p->time_slice;
+ 		if (unlikely(p->parent->time_slice > MAX_TIMESLICE))
+@@ -1055,6 +1391,10 @@ task_t * context_switch(runqueue_t *rq, 
+ 	struct mm_struct *mm = next->mm;
+ 	struct mm_struct *oldmm = prev->active_mm;
+ 
++  /*
++   * If the new task doesn't have an mm, make it the same
++   * as the old task's.
++   */
+ 	if (unlikely(!mm)) {
+ 		next->active_mm = oldmm;
+ 		atomic_inc(&oldmm->mm_count);
+@@ -1062,6 +1402,13 @@ task_t * context_switch(runqueue_t *rq, 
+ 	} else
+ 		switch_mm(oldmm, mm, next);
+ 
++  /*
++   * If the previous task does not have an mm,
++   * set its active_mm field to NULL, warn, and
++   * then set the runqueue's previous mm to the previous
++   * task's active_mm for use in making good cache hotness
++   * decisions in the future.
++   */
+ 	if (unlikely(!prev->mm)) {
+ 		prev->active_mm = NULL;
+ 		WARN_ON(rq->prev_mm);
+@@ -1177,9 +1524,15 @@ static int find_idlest_cpu(struct task_s
+ 	min_cpu = UINT_MAX;
+ 	min_load = ULONG_MAX;
+ 
++  /* set mask to a map created by
++   * 1) getting a bitmap of online CPUs in the right scheduler domain
++   * 2) & the map from step 1 with p's allowed CPU
++   * The result is a map of CPUs that p could potentially run on.
++   */
+ 	cpus_and(mask, sd->span, cpu_online_map);
+ 	cpus_and(mask, mask, p->cpus_allowed);
+ 
++  /* cycle through each CPU looking for the one with the lowest load */
+ 	for_each_cpu_mask(i, mask) {
+ 		load = target_load(i);
+ 
+@@ -1226,11 +1579,13 @@ void fastcall wake_up_forked_thread(task
+ 
+ 	/*
+ 	 * Find the largest domain that this CPU is part of that
+-	 * is willing to balance on clone:
++	 * is willing to balance on clone; that is, a domain willing
++   * to accept cloned tasks onto its CPUs.
+ 	 */
+ 	for_each_domain(this_cpu, tmp)
+ 		if (tmp->flags & SD_BALANCE_CLONE)
+ 			sd = tmp;
++  /* If a domain was found, choose its idlest CPU, otherwise just use this CPU */
+ 	if (sd)
+ 		cpu = find_idlest_cpu(p, this_cpu, sd);
+ 	else
+@@ -1256,7 +1611,9 @@ lock_again:
+ 	/*
+ 	 * We decrease the sleep average of forking parents
+ 	 * and children as well, to keep max-interactive tasks
+-	 * from forking tasks that are max-interactive.
++	 * from forking tasks that are max-interactive. This is similar
++   * to what we do when new processes are forked
++   * (in wake_up_forked_process())
+ 	 */
+ 	current->sleep_avg = JIFFIES_TO_NS(CURRENT_BONUS(current) *
+ 		PARENT_PENALTY / 100 * MAX_SLEEP_AVG / MAX_BONUS);
+@@ -1341,10 +1698,16 @@ void sched_balance_exec(void)
+ 	if (this_rq()->nr_running <= 1)
+ 		goto out;
+ 
++  /*
++   * Find the largest domain this CPU belongs to that is willing to
++   * balance on exec.
++   */
+ 	for_each_domain(this_cpu, tmp)
+ 		if (tmp->flags & SD_BALANCE_EXEC)
+ 			sd = tmp;
+ 
++  /* If a domain was found, find its idlest CPU and migrate there
++   * Otherwise, just stay on this CPU. */
+ 	if (sd) {
+ 		new_cpu = find_idlest_cpu(current, this_cpu, sd);
+ 		if (new_cpu != this_cpu) {
+@@ -1385,10 +1748,11 @@ void pull_task(runqueue_t *src_rq, prio_
+ 	set_task_cpu(p, this_cpu);
+ 	this_rq->nr_running++;
+ 	enqueue_task(p, this_array);
+-	p->timestamp = (p->timestamp - src_rq->timestamp_last_tick)
++	/* account for differences in timestamp between CPUs */
++  p->timestamp = (p->timestamp - src_rq->timestamp_last_tick)
+ 				+ this_rq->timestamp_last_tick;
+ 	/*
+-	 * Note that idle threads have a prio of MAX_PRIO, for this test
++	 * Note that idle threads have a prio of MAX_PRIO, so this test
+ 	 * to be always true for them.
+ 	 */
+ 	if (TASK_PREEMPTS_CURR(p, this_rq))
+@@ -1514,17 +1878,21 @@ find_busiest_group(struct sched_domain *
+ 
+ 	max_load = this_load = total_load = total_pwr = 0;
+ 
++  /* go through each group, done with a do loop since this is a circular linked list */
+ 	do {
+ 		cpumask_t tmp;
+ 		unsigned long load;
+ 		int local_group;
+ 		int i, nr_cpus = 0;
+ 
++    /* is the current CPU in the group we're looking at? */
+ 		local_group = cpu_isset(this_cpu, group->cpumask);
+ 
+ 		/* Tally up the load of all CPUs in the group */
+ 		avg_load = 0;
++    /* make a map, tmp, of CPUs in this group and online */
+ 		cpus_and(tmp, group->cpumask, cpu_online_map);
++    /* if this group doesn't contain any online CPUs, move on */
+ 		if (unlikely(cpus_empty(tmp)))
+ 			goto nextgroup;
+ 
+@@ -1539,6 +1907,10 @@ find_busiest_group(struct sched_domain *
+ 			avg_load += load;
+ 		}
+ 
++    /* 
++     * This check is redundant since it can never be true, and has
++     * apparently been fixed in Linux 2.6.10rc3
++     */
+ 		if (!nr_cpus)
+ 			goto nextgroup;
+ 
+@@ -1551,7 +1923,7 @@ find_busiest_group(struct sched_domain *
+ 		if (local_group) {
+ 			this_load = avg_load;
+ 			this = group;
+-			goto nextgroup;
++			goto nextgroup; /* pointless goto since it goes there anyway */
+ 		} else if (avg_load > max_load) {
+ 			max_load = avg_load;
+ 			busiest = group;
+@@ -1573,7 +1945,7 @@ nextgroup:
+ 	 * We're trying to get all the cpus to the average_load, so we don't
+ 	 * want to push ourselves above the average load, nor do we wish to
+ 	 * reduce the max loaded cpu below the average load, as either of these
+-	 * actions would just result in more rebalancing later, and ping-pong
++	 * actions would just result in more rebalancing later, and ping-ponging
+ 	 * tasks around. Thus we look for the minimum possible imbalance.
+ 	 * Negative imbalances (*we* are more loaded than anyone else) will
+ 	 * be counted as no imbalance for these purposes -- we can't fix that
+@@ -1985,6 +2357,7 @@ void scheduler_tick(int user_ticks, int 
+ 	runqueue_t *rq = this_rq();
+ 	task_t *p = current;
+ 
++  /* update last tick timestamp to now */
+ 	rq->timestamp_last_tick = sched_clock();
+ 
+ 	if (rcu_pending(cpu))
+@@ -1998,24 +2371,36 @@ void scheduler_tick(int user_ticks, int 
+ 		cpustat->softirq += sys_ticks;
+ 		sys_ticks = 0;
+ 	}
+-
++ 
++  /* if the current task is the idle task... */
+ 	if (p == rq->idle) {
++    /* If at least one task is waiting on i/o, then
++     * the the time since the last tick was spent waiting
++     * on I/O, and that is why we're idle. Otherwise, we just
++     * have nothing to do. Update cpustat accordingly.
++     */
+ 		if (atomic_read(&rq->nr_iowait) > 0)
+ 			cpustat->iowait += sys_ticks;
+ 		else
+ 			cpustat->idle += sys_ticks;
++    /* wke up a priority sleeper since we're idle for one reason or another */
+ 		if (wake_priority_sleeper(rq))
+ 			goto out;
++    /* if we couldn't wake anything up, then try to rebalance */
+ 		rebalance_tick(cpu, rq, IDLE);
++    /* leave since we were idle and did what we could */
+ 		return;
+ 	}
++  
+ 	if (TASK_NICE(p) > 0)
+ 		cpustat->nice += user_ticks;
+ 	else
+ 		cpustat->user += user_ticks;
+ 	cpustat->system += sys_ticks;
+ 
+-	/* Task might have expired already, but not scheduled off yet */
++	/* Task might have expired already, but not scheduled off yet.
++   * Possible since we're in a timer interrupt right now.
++   */
+ 	if (p->array != rq->active) {
+ 		set_tsk_need_resched(p);
+ 		goto out;
+@@ -2044,22 +2429,34 @@ void scheduler_tick(int user_ticks, int 
+ 		}
+ 		goto out_unlock;
+ 	}
++  /* if the task is out of time */
+ 	if (!--p->time_slice) {
++    /* dequeue it from the active prio array */
+ 		dequeue_task(p, rq->active);
++    /* reschedule it */
+ 		set_tsk_need_resched(p);
++    /* recalculte its priority */
+ 		p->prio = effective_prio(p);
++    /* give it a new timeslice */
+ 		p->time_slice = task_timeslice(p);
++    /*
++     * This can't be its first timeslice since it just ran out
++     * of one. Remember that tasks that exit on their first timeslice
++     * can give part of their timeslice back to the parent task.
++     */
+ 		p->first_time_slice = 0;
+ 
+ 		if (!rq->expired_timestamp)
+ 			rq->expired_timestamp = jiffies;
++    /* if the task is not interactive or there is something starving on the expired list */
+ 		if (!TASK_INTERACTIVE(p) || EXPIRED_STARVING(rq)) {
++      /* enqueue the task on the expired list */
+ 			enqueue_task(p, rq->expired);
+ 			if (p->static_prio < rq->best_expired_prio)
+ 				rq->best_expired_prio = p->static_prio;
+-		} else
++		} else /* otherwise put it back on the active list */
+ 			enqueue_task(p, rq->active);
+-	} else {
++	} else { /* task is not out of time */
+ 		/*
+ 		 * Prevent a too long timeslice allowing a task to monopolize
+ 		 * the CPU. We do this by splitting up the timeslice into
+@@ -2088,12 +2485,22 @@ void scheduler_tick(int user_ticks, int 
+ 		}
+ 	}
+ out_unlock:
++  /* we are done messing with this runqueue so unlock it */
+ 	spin_unlock(&rq->lock);
+ out:
++  /* see if we need to do some rebalancing */
+ 	rebalance_tick(cpu, rq, NOT_IDLE);
+ }
+ 
+ #ifdef CONFIG_SCHED_SMT
++/*
++ * If there are other idle virtual processors associated with the given cpu,
++ * and they have runnable tasks, try to wake them up. This is called in
++ * schedule(), when the current CPU is has no runnable tasks and idle rebalancing
++ * fails to add any runnable tasks. This is because on SMT, tasks can be sleeping
++ * in order to give other sibling processors with higher priority tasks full
++ * access to cache.
++ */
+ static inline void wake_sleeping_dependent(int cpu, runqueue_t *rq)
+ {
+ 	int i;
+@@ -2205,12 +2612,12 @@ asmlinkage void __sched schedule(void)
+ 	}
+ 
+ need_resched:
+-	preempt_disable();
+-	prev = current;
+-	rq = this_rq();
++	preempt_disable(); /* do not allow this algorithm to be preempted */
++	prev = current;    /* whatever task is running now will be the previous task */
++	rq = this_rq();    /* get the runqueue for the processor that needs scheduling */
+ 
+ 	release_kernel_lock(prev);
+-	now = sched_clock();
++	now = sched_clock(); /* get the current time in nanoseconds */
+ 	if (likely(now - prev->timestamp < NS_MAX_SLEEP_AVG))
+ 		run_time = now - prev->timestamp;
+ 	else
+@@ -2226,10 +2633,6 @@ need_resched:
+ 
+ 	spin_lock_irq(&rq->lock);
+ 
+-	/*
+-	 * if entering off of a kernel preemption go straight
+-	 * to picking the next task.
+-	 */
+ 	switch_count = &prev->nivcsw;
+ 	if (prev->state && !(preempt_count() & PREEMPT_ACTIVE)) {
+ 		switch_count = &prev->nvcsw;
+@@ -2241,6 +2644,11 @@ need_resched:
+ 	}
+ 
+ 	cpu = smp_processor_id();
++  /*
++   * If there are no runnable tasks in the runqueue, try to do an idle balance.
++   * If nothing is runnable after that, just switch to idle. No need to swap arrays
++   * since there is nothing runnable in the expired array or the active one.
++   */
+ 	if (unlikely(!rq->nr_running)) {
+ 		idle_balance(cpu, rq);
+ 		if (!rq->nr_running) {
+@@ -2251,6 +2659,7 @@ need_resched:
+ 		}
+ 	}
+ 
++  /* If there are no runnable tasks in the active prio array, swap arrays. */
+ 	array = rq->active;
+ 	if (unlikely(!array->nr_active)) {
+ 		/*
+@@ -2263,15 +2672,27 @@ need_resched:
+ 		rq->best_expired_prio = MAX_PRIO;
+ 	}
+ 
++  /* find the first priority level with tasks in it, and grab the first task in it */
+ 	idx = sched_find_first_bit(array->bitmap);
+ 	queue = array->queue + idx;
+ 	next = list_entry(queue->next, task_t, run_list);
+ 
++  /*
++   * If there is a dependent sleeper, a task sleeping on a sibling virtual
++   * CPU on SMT systems, just switch to idle and let dependent_sleeper() wake
++   * up the dependent task.
++   */
+ 	if (dependent_sleeper(cpu, rq, next)) {
+ 		next = rq->idle;
+ 		goto switch_tasks;
+ 	}
+ 
++  /*
++   * If the next task is not an RT task and has been woken up,
++   * give it a new priority calculated with a longer sleep time
++   * as a boost. If the tasks is a normal first-time wakeup
++   * (next->activated == 1), weigh down the bonus.
++   */
+ 	if (!rt_task(next) && next->activated > 0) {
+ 		unsigned long long delta = now - next->timestamp;
+ 
+@@ -2283,13 +2704,23 @@ need_resched:
+ 		recalc_task_prio(next, next->timestamp + delta);
+ 		enqueue_task(next, array);
+ 	}
++  /* clear the next task's activated status */
+ 	next->activated = 0;
++  
++  /* make the switch to whatever next task was selected */
+ switch_tasks:
+ 	prefetch(next);
+ 	clear_tsk_need_resched(prev);
+ 	RCU_qsctr(task_cpu(prev))++;
+ 
++  /* subtract running time from previous task's sleep_avg */
+ 	prev->sleep_avg -= run_time;
++  
++  /*
++   * If the previous task's sleep average is 0 or lower now,
++   * set it to 0 and then drop its interactive credit since
++   * it obviously wasn't sleeping much and is thus less I/O bound.
++   */
+ 	if ((long)prev->sleep_avg <= 0) {
+ 		prev->sleep_avg = 0;
+ 		if (!(HIGH_CREDIT(prev) || LOW_CREDIT(prev)))
+@@ -2297,6 +2728,7 @@ switch_tasks:
+ 	}
+ 	prev->timestamp = now;
+ 
++  /* make the actual context switch if prev and next are not the same */
+ 	if (likely(prev != next)) {
+ 		next->timestamp = now;
+ 		rq->nr_switches++;
+@@ -2313,6 +2745,10 @@ switch_tasks:
+ 
+ 	reacquire_kernel_lock(current);
+ 	preempt_enable_no_resched();
++  /*
++   * Since preemtion was disabled this whole time, check to see if kernel
++   * preemption was requested (reschedule requested) and reschedule if so.
++   */
+ 	if (test_thread_flag(TIF_NEED_RESCHED))
+ 		goto need_resched;
+ }
+@@ -2331,12 +2767,18 @@ asmlinkage void __sched preempt_schedule
+ 
+ 	/*
+ 	 * If there is a non-zero preempt_count or interrupts are disabled,
+-	 * we do not want to preempt the current task.  Just return..
++	 * we do not want to preempt the current task.  Just return.
+ 	 */
+ 	if (unlikely(ti->preempt_count || irqs_disabled()))
+ 		return;
+ 
+ need_resched:
++  /*
++   * Set preempt count to indicate that we are preempting, reschedule,
++   * and then clear the preempt count as rescheduling has happened.
++   * Only needs to reschedule once no matter how many time the reschedule
++   * was requested.
++   */
+ 	ti->preempt_count = PREEMPT_ACTIVE;
+ 	schedule();
+ 	ti->preempt_count = 0;
+@@ -2350,6 +2792,7 @@ need_resched:
+ EXPORT_SYMBOL(preempt_schedule);
+ #endif /* CONFIG_PREEMPT */
+ 
++/* exported call for trying to wake up a task */
+ int default_wake_function(wait_queue_t *curr, unsigned mode, int sync, void *key)
+ {
+ 	task_t *p = curr->task;
+@@ -2372,11 +2815,17 @@ static void __wake_up_common(wait_queue_
+ {
+ 	struct list_head *tmp, *next;
+ 
++  /* go through each task in the wait queue */
+ 	list_for_each_safe(tmp, next, &q->task_list) {
+ 		wait_queue_t *curr;
+ 		unsigned flags;
+ 		curr = list_entry(tmp, wait_queue_t, task_list);
+ 		flags = curr->flags;
++    /*
++     * Try to wake up the task, and if it was exclusive and there are more
++     * exclusive tasks in the wait queue, then quit. Don't want to wake up
++     * more than one exclusive task at a time.
++     */
+ 		if (curr->func(curr, mode, sync, key) &&
+ 		    (flags & WQ_FLAG_EXCLUSIVE) &&
+ 		    !--nr_exclusive)
+@@ -2428,9 +2877,11 @@ void fastcall __wake_up_sync(wait_queue_
+ 	unsigned long flags;
+ 	int sync = 1;
+ 
++  /* obviously, leave if there is no wait queue */
+ 	if (unlikely(!q))
+ 		return;
+ 
++  /* if there are no exclusive tasks, don't do sync */
+ 	if (unlikely(!nr_exclusive))
+ 		sync = 0;
+ 
+@@ -2585,6 +3036,7 @@ void set_user_nice(task_t *p, long nice)
+ 	if (array)
+ 		dequeue_task(p, array);
+ 
++  /* set the new static_prio and just adjust the dynamic prio instead of recalculating */
+ 	old_prio = p->prio;
+ 	new_prio = NICE_TO_PRIO(nice);
+ 	delta = new_prio - old_prio;
+@@ -2743,6 +3195,7 @@ static int setscheduler(pid_t pid, int p
+ 	 */
+ 	rq = task_rq_lock(p, &flags);
+ 
++  /* makes sure the policy is sane */
+ 	if (policy < 0)
+ 		policy = p->policy;
+ 	else {
+@@ -2910,6 +3363,7 @@ asmlinkage long sys_sched_setaffinity(pi
+ 	if (copy_from_user(&new_mask, user_mask_ptr, sizeof(new_mask)))
+ 		return -EFAULT;
+ 
++  /* don't allow CPU hotplugging while we do this - obvious consequences */
+ 	lock_cpu_hotplug();
+ 	read_lock(&tasklist_lock);
+ 
+@@ -3397,9 +3851,9 @@ static void __migrate_task(struct task_s
+ 		 */
+ 		p->timestamp = p->timestamp - rq_src->timestamp_last_tick
+ 				+ rq_dest->timestamp_last_tick;
+-		deactivate_task(p, rq_src);
+-		activate_task(p, rq_dest, 0);
+-		if (TASK_PREEMPTS_CURR(p, rq_dest))
++		deactivate_task(p, rq_src); /* off the runqueue it is on */
++		activate_task(p, rq_dest, 0); /* on the runqueue it should be on */
++		if (TASK_PREEMPTS_CURR(p, rq_dest)) /* perhaps preempt dest cpu's current task */
+ 			resched_task(rq_dest->curr);
+ 	}
+ 
+@@ -3421,25 +3875,33 @@ static int migration_thread(void * data)
+ 	BUG_ON(rq->migration_thread != current);
+ 
+ 	set_current_state(TASK_INTERRUPTIBLE);
++  
++  /* basically, just keep trying to be helpful in one way or another
++   * until we're told to die... 
++   */
+ 	while (!kthread_should_stop()) {
+ 		struct list_head *head;
+ 		migration_req_t *req;
+ 
++    /* can I freeze the current thread for you? */
+ 		if (current->flags & PF_FREEZE)
+ 			refrigerator(PF_FREEZE);
+ 
+ 		spin_lock_irq(&rq->lock);
+ 
++    /* Is this CPU offline? If so, I'll just go die. */
+ 		if (cpu_is_offline(cpu)) {
+ 			spin_unlock_irq(&rq->lock);
+ 			goto wait_to_die;
+ 		}
+ 
++    /* does my runqueue need to be balanced? */
+ 		if (rq->active_balance) {
+ 			active_load_balance(rq, cpu);
+ 			rq->active_balance = 0;
+ 		}
+ 
++    /* anything need to be migrated? If not, schedule me out. */
+ 		head = &rq->migration_queue;
+ 
+ 		if (list_empty(head)) {
+@@ -3448,6 +3910,7 @@ static int migration_thread(void * data)
+ 			set_current_state(TASK_INTERRUPTIBLE);
+ 			continue;
+ 		}
++    /* do some migration */
+ 		req = list_entry(head->next, migration_req_t, list);
+ 		list_del_init(head->next);
+ 
+@@ -3466,9 +3929,11 @@ static int migration_thread(void * data)
+ 
+ 		complete(&req->done);
+ 	}
++  /* migration thread suicide */
+ 	__set_current_state(TASK_RUNNING);
+ 	return 0;
+ 
++  /* migration thread hospice... with no CPU, time is running out for us... */
+ wait_to_die:
+ 	/* Wait for kthread_stop */
+ 	set_current_state(TASK_INTERRUPTIBLE);
+@@ -3481,7 +3946,7 @@ wait_to_die:
+ }
+ 
+ #ifdef CONFIG_HOTPLUG_CPU
+-/* migrate_all_tasks - function to migrate all tasks from the dead cpu.  */
++/* migrate_all_tasks - function to migrate all tasks from the dead cpu. */
+ static void migrate_all_tasks(int src_cpu)
+ {
+ 	struct task_struct *tsk, *t;
+@@ -3729,6 +4194,7 @@ static void __init arch_init_sched_domai
+ 		struct sched_group *node = &sched_group_nodes[i];
+ 		int j;
+ 
++    /* get mask of node cpus that are possible */
+ 		cpus_and(nodemask, tmp, cpu_possible_map);
+ 
+ 		if (cpus_empty(nodemask))
+@@ -3744,6 +4210,7 @@ static void __init arch_init_sched_domai
+ 			cpu_set(j, cpu->cpumask);
+ 			cpu->cpu_power = SCHED_LOAD_SCALE;
+ 
++      /* set up circular linked list */
+ 			if (!first_cpu)
+ 				first_cpu = cpu;
+ 			if (last_cpu)
